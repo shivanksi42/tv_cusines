@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 import requests
 from collections import Counter, defaultdict
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 import logging
 from functools import wraps
 import time
@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
- 
     BASE_URL = "https://api.staging.tracevenue.com"
     ENDPOINT = "/api/v1/traceVenue/variant/filteredVariants"
     TIMEOUT = 30 
@@ -41,13 +40,12 @@ def handle_api_errors(f):
             }), 500
     return decorated_function
 
-def fetch_variants_data(request_payload: Optional[Dict] = None, method: str = 'POST') -> Dict[str, Any]:
+def fetch_variants_data(request_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Fetch variants data from the external API
     
     Args:
-        request_payload: Request payload to send to the API
-        method: HTTP method to use (GET or POST)
+        request_payload: Request payload to send to the API (required)
         
     Returns:
         API response data
@@ -57,29 +55,11 @@ def fetch_variants_data(request_payload: Optional[Dict] = None, method: str = 'P
     headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        
     }
     
-
-    if request_payload is None:
-        request_payload = {
-            "locations": ["Mohali"],
-            "radius": 10,
-            "eventTypeId": "67bc5e973bc3df51e0c50a41",
-            "eventName": "Retirement party pack",
-            "minPerson": 450,
-            "maxPerson": 500,
-            "latitude": 30.7215043,
-            "longitude": 76.7026142
-        }
- 
-    method = 'POST'
-    
-
     for attempt in range(config.MAX_RETRIES):
         try:
             logger.info(f"Fetching data from {url} (attempt {attempt + 1})")
-            logger.info(f"Method: {method}")
             logger.info(f"Payload: {request_payload}")
             logger.info(f"Headers: {headers}")
             
@@ -113,9 +93,58 @@ def fetch_variants_data(request_payload: Optional[Dict] = None, method: str = 'P
             logger.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying...")
             time.sleep(2 ** attempt)
 
+def extract_categories_from_menu_item(menu_item: Dict) -> Set[Tuple[str, str]]:
+    """
+    Extract categories from a menu item, prioritizing parent categories.
+    Returns set of (category_id, category_name) tuples.
+    """
+    categories = set()
+    
+    for category in menu_item.get('category', []):
+        parent_categories = category.get('parentCategories', [])
+        
+        if parent_categories:
+            # Use parent category if available
+            for parent_cat in parent_categories:
+                categories.add((parent_cat.get('_id', ''), parent_cat.get('name', '')))
+        else:
+            # Use original category if no parent category
+            categories.add((category.get('_id', ''), category.get('name', '')))
+    
+    return categories
+
+def extract_services_from_variant(variant: Dict) -> Tuple[List[str], List[str]]:
+    """
+    Extract free and paid services from a variant's freeServices and paidServices arrays.
+    
+    Args:
+        variant: Variant dictionary containing freeServices and paidServices arrays
+        
+    Returns:
+        Tuple of (free_services_names, paid_services_names)
+    """
+    free_services = []
+    paid_services = []
+    
+    # Extract free services
+    free_services_array = variant.get('freeServices', [])
+    for service in free_services_array:
+        service_name = service.get('serviceName', '')
+        if service_name:
+            free_services.append(service_name)
+    
+    # Extract paid services
+    paid_services_array = variant.get('paidServices', [])
+    for service in paid_services_array:
+        service_name = service.get('serviceName', '')
+        if service_name:
+            paid_services.append(service_name)
+    
+    return free_services, paid_services
+
 def parse_restaurant_variants(api_response: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Parse restaurant variants data to extract cuisine combinations and related information.
+    Parse restaurant variants data to extract cuisine combinations and detailed statistics.
     """
     variants = api_response.get('variants', [])
     if not variants:
@@ -137,18 +166,30 @@ def parse_restaurant_variants(api_response: Dict[str, Any]) -> Dict[str, Any]:
     cuisine_combinations = []
     all_cuisine_ids = set()
     
+    # Process each variant
     for variant in variants:
         variant_id = variant.get('_id', 'unknown')
         variant_name = variant.get('name', 'unnamed')
         menu_items = variant.get('menuItems', [])
+        venue_id = variant.get('venueId', '')
+        cost = variant.get('cost', 0)
+        
+        # Extract services using the new function
+        free_services_names, paid_services_names = extract_services_from_variant(variant)
         
         variant_cuisines = set()
+        variant_categories = set()
         
         for menu_item in menu_items:
+            # Extract cuisines
             cuisines = menu_item.get('cuisine', [])
             for cuisine_id in cuisines:
                 variant_cuisines.add(cuisine_id)
                 all_cuisine_ids.add(cuisine_id)
+            
+            # Extract categories
+            categories = extract_categories_from_menu_item(menu_item)
+            variant_categories.update(categories)
         
         variant_cuisine_list = sorted(list(variant_cuisines))
         
@@ -158,35 +199,110 @@ def parse_restaurant_variants(api_response: Dict[str, Any]) -> Dict[str, Any]:
             'cuisines': variant_cuisine_list,
             'cuisine_count': len(variant_cuisine_list),
             'menu_items_count': len(menu_items),
-            'cost': variant.get('cost', 0),
+            'categories': list(variant_categories),
+            'categories_count': len(variant_categories),
+            'cost': cost,
             'min_persons': variant.get('minPersons', 0),
             'max_persons': variant.get('maxPersons', 0),
-            'is_customized': variant.get('isCustomized', False)
+            'is_customized': variant.get('isCustomized', False),
+            'venue_id': venue_id,
+            'free_services': free_services_names,
+            'paid_services': paid_services_names,
+            'free_services_count': len(free_services_names),
+            'paid_services_count': len(paid_services_names)
         })
         
         if variant_cuisine_list:
             cuisine_combinations.append(tuple(variant_cuisine_list))
     
-    combination_counter = Counter(cuisine_combinations)
-    sorted_combinations = combination_counter.most_common()
+    # Group variants by cuisine combination
+    combination_groups = defaultdict(list)
+    for variant in restaurant_variants:
+        combination_key = tuple(variant['cuisines'])
+        combination_groups[combination_key].append(variant)
     
+    # Calculate detailed statistics for each combination
     formatted_combinations = []
-    for combination, count in sorted_combinations:
+    for combination, variants_in_combo in combination_groups.items():
+        # Price range statistics
+        costs = [v['cost'] for v in variants_in_combo if v['cost'] > 0]
+        price_range = {
+            'min_price': min(costs) if costs else 0,
+            'max_price': max(costs) if costs else 0,
+            'average_price': sum(costs) / len(costs) if costs else 0
+        }
+        
+        # Unique cuisine IDs statistics
+        unique_cuisines = list(combination)
+        cuisine_stats = {
+            'unique_cuisine_ids': unique_cuisines,
+            'total_cuisine_count': len(unique_cuisines)
+        }
+        
+        # Menu items and categories statistics
+        total_menu_items = sum(v['menu_items_count'] for v in variants_in_combo)
+        all_categories = set()
+        for variant in variants_in_combo:
+            all_categories.update(variant['categories'])
+        
+        menu_stats = {
+            'total_menu_items': total_menu_items,
+            'total_unique_categories': len(all_categories),
+            'category_names': [cat[1] for cat in all_categories if cat[1]]  # Extract category names
+        }
+        
+        # Unique venues
+        unique_venues = set(v['venue_id'] for v in variants_in_combo if v['venue_id'])
+        venue_stats = {
+            'total_unique_venues': len(unique_venues),
+            'venue_ids': list(unique_venues)
+        }
+        
+        # Free and paid services statistics - Updated to use proper service names
+        all_free_services = []
+        all_paid_services = []
+        
+        for variant in variants_in_combo:
+            all_free_services.extend(variant['free_services'])
+            all_paid_services.extend(variant['paid_services'])
+        
+        # Get unique service names
+        unique_free_services = list(set(all_free_services))
+        unique_paid_services = list(set(all_paid_services))
+        
+        service_stats = {
+            'total_unique_free_services': len(unique_free_services),
+            'free_service_names': unique_free_services,
+            'total_unique_paid_services': len(unique_paid_services),
+            'paid_service_names': unique_paid_services
+        }
+        
+        # Matching variants info
         matching_variants = []
-        for variant in restaurant_variants:
-            if tuple(variant['cuisines']) == combination:
-                matching_variants.append({
-                    'variant_id': variant['variant_id'],
-                    'variant_name': variant['variant_name'],
-                    'cost': variant['cost']
-                })
+        for variant in variants_in_combo:
+            matching_variants.append({
+                'variant_id': variant['variant_id'],
+                'variant_name': variant['variant_name'],
+                'cost': variant['cost'],
+                'venue_id': variant['venue_id'],
+                'free_services_count': variant['free_services_count'],
+                'paid_services_count': variant['paid_services_count']
+            })
         
         formatted_combinations.append({
             'cuisine_combination': list(combination),
-            'frequency': count,
+            'frequency': len(variants_in_combo),
+            'combination_size': len(combination),
             'matching_variants': matching_variants,
-            'combination_size': len(combination)
+            'price_range': price_range,
+            'cuisine_stats': cuisine_stats,
+            'menu_stats': menu_stats,
+            'venue_stats': venue_stats,
+            'service_stats': service_stats
         })
+    
+    # Sort combinations by frequency
+    formatted_combinations.sort(key=lambda x: x['frequency'], reverse=True)
     
     restaurant_data = [{
         'restaurant_id': restaurant_id,
@@ -213,7 +329,7 @@ def parse_restaurant_variants(api_response: Dict[str, Any]) -> Dict[str, Any]:
 @handle_api_errors
 def get_cuisine_analysis():
     """
-    Get cuisine analysis for restaurant variants
+    Get comprehensive cuisine analysis for restaurant variants
     
     For POST requests, send the payload in request body
     For GET requests, parameters are converted to payload
@@ -222,25 +338,45 @@ def get_cuisine_analysis():
     - restaurant_id: Optional restaurant ID to filter by
     - page: Page number for pagination
     - limit: Number of results per page
+    - include_summary: Include summary statistics (default: true)
+    - include_variants: Include detailed variant data (default: true)
+    - include_combinations: Include cuisine combinations (default: true)
     - Any other parameters your external API expects
+    
+    Returns:
+    - Enhanced cuisine combinations with detailed statistics including:
+      * Price ranges (min, max, average)
+      * Unique cuisine counts and IDs
+      * Menu items and categories statistics
+      * Unique venues count
+      * Free and paid services statistics with proper service names from allServices
     """
     
     if request.method == 'POST':
-        request_payload = request.get_json() or {}
-        method = 'POST'
+        request_payload = request.get_json()
+        if not request_payload:
+            return jsonify({
+                'error': 'Missing request payload',
+                'message': 'POST request requires a JSON payload'
+            }), 400
     else:
         request_payload = {}
         for key, value in request.args.items():
             if key not in ['include_summary', 'include_variants', 'include_combinations']:
                 request_payload[key] = value
-        method = 'GET'
+        
+        if not request_payload:
+            return jsonify({
+                'error': 'Missing request parameters',
+                'message': 'GET request requires query parameters for the external API'
+            }), 400
     
     include_summary = request.args.get('include_summary', 'true').lower() == 'true'
     include_variants = request.args.get('include_variants', 'true').lower() == 'true'
     include_combinations = request.args.get('include_combinations', 'true').lower() == 'true'
     
     logger.info(f"Fetching variants data with payload: {request_payload}")
-    api_response = fetch_variants_data(request_payload, method)
+    api_response = fetch_variants_data(request_payload)
     
     parsed_data = parse_restaurant_variants(api_response)
     
@@ -260,6 +396,7 @@ def get_cuisine_analysis():
     logger.info(f"Successfully processed {parsed_data['summary']['total_variants']} variants")
     return jsonify(response_data)
 
+@app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
