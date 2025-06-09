@@ -8,8 +8,9 @@ import time
 from dotenv import load_dotenv
 import os
 from flask_cors import CORS
-app = Flask(__name__)
+from urllib.parse import urljoin, urlparse
 
+app = Flask(__name__)
 CORS(app)
 
 logging.basicConfig(level=logging.INFO)
@@ -23,8 +24,23 @@ class Config:
     TIMEOUT = int(os.getenv("TIMEOUT", "30"))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     
-  
+    def __post_init__(self):
+        # Validate and clean URLs
+        self.BASE_URL = self.BASE_URL.rstrip('/')
+        if not self.ENDPOINT.startswith('/'):
+            self.ENDPOINT = '/' + self.ENDPOINT
+        
+        # Validate base URL
+        parsed = urlparse(self.BASE_URL)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"Invalid BASE_URL: {self.BASE_URL}")
+        
+        logger.info(f"Base URL: {self.BASE_URL}")
+        logger.info(f"Endpoint: {self.ENDPOINT}")
+        logger.info(f"Full URL: {self.BASE_URL}{self.ENDPOINT}")
+
 config = Config()
+config.__post_init__()
 
 def handle_api_errors(f):
     """Decorator to handle API errors gracefully"""
@@ -56,12 +72,21 @@ def fetch_variants_data(request_payload: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         API response data
     """
-    url = f"{config.BASE_URL}{config.ENDPOINT}"
+    # Use urljoin for safer URL construction
+    url = urljoin(config.BASE_URL + '/', config.ENDPOINT.lstrip('/'))
+    
+    # Alternative: Manual construction with validation
+    # url = f"{config.BASE_URL}{config.ENDPOINT}"
     
     headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
     }
+    
+    # Log the actual URL being used
+    logger.info(f"Constructed URL: {url}")
+    logger.info(f"Base URL: {config.BASE_URL}")
+    logger.info(f"Endpoint: {config.ENDPOINT}")
     
     for attempt in range(config.MAX_RETRIES):
         try:
@@ -330,32 +355,11 @@ def parse_restaurant_variants(api_response: Dict[str, Any]) -> Dict[str, Any]:
         }
     }
 
-
 @app.route('/api/restaurant/cuisine-analysis', methods=['GET', 'POST'])
 @handle_api_errors
 def get_cuisine_analysis():
     """
     Get comprehensive cuisine analysis for restaurant variants
-    
-    For POST requests, send the payload in request body
-    For GET requests, parameters are converted to payload
-    
-    Query Parameters (GET) or Body Parameters (POST):
-    - restaurant_id: Optional restaurant ID to filter by
-    - page: Page number for pagination
-    - limit: Number of results per page
-    - include_summary: Include summary statistics (default: true)
-    - include_variants: Include detailed variant data (default: true)
-    - include_combinations: Include cuisine combinations (default: true)
-    - Any other parameters your external API expects
-    
-    Returns:
-    - Enhanced cuisine combinations with detailed statistics including:
-      * Price ranges (min, max, average)
-      * Unique cuisine counts and IDs
-      * Menu items and categories statistics
-      * Unique venues count
-      * Free and paid services statistics with proper service names from allServices
     """
     
     if request.method == 'POST':
@@ -409,6 +413,17 @@ def health_check():
         'status': 'healthy',
         'timestamp': time.time(),
         'external_api_url': f"{config.BASE_URL}{config.ENDPOINT}"
+    })
+
+@app.route('/debug/config', methods=['GET'])
+def debug_config():
+    """Debug endpoint to check configuration"""
+    return jsonify({
+        'base_url': config.BASE_URL,
+        'endpoint': config.ENDPOINT,
+        'full_url': f"{config.BASE_URL}{config.ENDPOINT}",
+        'timeout': config.TIMEOUT,
+        'max_retries': config.MAX_RETRIES
     })
 
 @app.errorhandler(404)
