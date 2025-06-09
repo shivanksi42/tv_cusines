@@ -5,19 +5,25 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 import logging
 from functools import wraps
 import time
-
+from dotenv import load_dotenv
+import os
+from flask_cors import CORS
 app = Flask(__name__)
+
+CORS(app)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+load_dotenv()
 
 class Config:
-    BASE_URL = "https://api.staging.tracevenue.com"
-    ENDPOINT = "/api/v1/traceVenue/variant/filteredVariants"
-    TIMEOUT = 30 
-    MAX_RETRIES = 3
-
+    BASE_URL = os.getenv("BACKEND_BASE_URL", "https://api.staging.tracevenue.com")
+    ENDPOINT = os.getenv("FILTERED_VARIANTS_ENDPOINT", "/api/v1/traceVenue/variant/filteredVariants")
+    TIMEOUT = int(os.getenv("TIMEOUT", "30"))
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+    
+  
 config = Config()
 
 def handle_api_errors(f):
@@ -414,4 +420,5 @@ def internal_error(error):
     return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=True, host='0.0.0.0', port=port)
